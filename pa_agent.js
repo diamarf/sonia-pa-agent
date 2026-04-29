@@ -2,7 +2,7 @@
 
 /**
  * SONIA - PERSONAL ASSISTANT AGENT - TELEGRAM VERSION
- * OAuth token embedded
+ * With automatic token refresh
  */
 
 require('dotenv').config();
@@ -38,23 +38,22 @@ const STATE = {
   oauthReady: false
 };
 
-// OAuth setup
+// OAuth setup with refresh capability
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
-  process.env.GOOGLE_CLIENT_SECRET
+  process.env.GOOGLE_CLIENT_SECRET,
+  'http://localhost:3000/auth/callback'
 );
 
-// Set credentials directly from your token
+// Set initial credentials with refresh token
 oauth2Client.setCredentials({
   access_token: "ya29.a0AQvPyIPzUuW_9ympgBg_HIko4yPzCDxSlEZfPwS1mVYiJgaTSogGcV3EizH3sCqzqUD7CYumgacUDR5QrvtyxcaEiKoul2qQUIZs3OC_5VegZssWsg3sxwSsfiQ6J_n-z6Nl6o_xeUt42E8xuJC1PI6uZtEBfle2Q9OKNSNuB5IiHIKGhg7XKqZznKUPiWVV5VJA9Z0aCgYKAYkSARQSFQHGX2Mibcz2b10nELXuTAAmm48VQA0206",
   refresh_token: "1//03S2WzBKQsrIlCgYIARAAGAMSNwF-L9Ir7ChQqsOFx9OetnnxY15RgMKEak2PtGA0kEgcIt6KBzlGwNxjaRVeYNEb_4WE3NWcbqU",
-  scope: "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/calendar",
-  token_type: "Bearer",
   expiry_date: 1777459147595
 });
 
 STATE.oauthReady = true;
-console.log('✅ Google OAuth token loaded');
+console.log('✅ Google OAuth configured');
 
 // Express server
 const app = express();
@@ -94,6 +93,13 @@ const calendar = google.calendar({ version: 'v3' });
 
 async function checkEmails() {
   try {
+    // Auto-refresh token if needed
+    const credentials = oauth2Client.credentials;
+    if (credentials.expiry_date && credentials.expiry_date <= Date.now()) {
+      console.log('🔄 Refreshing OAuth token...');
+      await oauth2Client.refreshAccessToken();
+    }
+
     const response = await gmail.users.messages.list({
       userId: 'me',
       q: 'is:unread',
@@ -103,6 +109,7 @@ async function checkEmails() {
     
     const emails = [];
     if (response.data.messages) {
+      console.log(`📧 Found ${response.data.messages.length} unread emails`);
       for (const msg of response.data.messages) {
         try {
           const fullMsg = await gmail.users.messages.get({
@@ -116,6 +123,8 @@ async function checkEmails() {
           console.error('Error reading message:', e.message);
         }
       }
+    } else {
+      console.log('📧 No unread emails');
     }
     STATE.pendingEmails = emails;
     return emails;
@@ -157,6 +166,13 @@ function getBodyText(payload) {
 
 async function getCalendarEvents(daysAhead = 7) {
   try {
+    // Auto-refresh token if needed
+    const credentials = oauth2Client.credentials;
+    if (credentials.expiry_date && credentials.expiry_date <= Date.now()) {
+      console.log('🔄 Refreshing OAuth token...');
+      await oauth2Client.refreshAccessToken();
+    }
+
     const timeMin = new Date().toISOString();
     const timeMax = new Date(Date.now() + daysAhead * 24 * 60 * 60 * 1000).toISOString();
     
@@ -170,6 +186,7 @@ async function getCalendarEvents(daysAhead = 7) {
     });
     
     STATE.pendingMeetings = response.data.items || [];
+    console.log(`📅 Found ${STATE.pendingMeetings.length} calendar events`);
     return STATE.pendingMeetings;
   } catch (error) {
     console.error('📅 Calendar error:', error.message);
