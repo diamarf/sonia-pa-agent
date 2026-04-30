@@ -34,18 +34,19 @@ async function ensureValidToken() {
   try {
     const creds = oauth2Client.credentials;
     if (!creds.expiry_date || creds.expiry_date <= Date.now()) {
-      await oauth2Client.refreshAccessToken();
+      const { credentials: newCreds } = await oauth2Client.refreshAccessToken();
+      oauth2Client.setCredentials(newCreds);
     }
     return true;
   } catch (e) {
-    console.error('Token error:', e.message);
+    console.error('Token refresh error:', e.message);
     return false;
   }
 }
 
 async function getUnreadEmails() {
   try {
-    await ensureValidToken();
+    if (!await ensureValidToken()) return [];
     const res = await gmail.users.messages.list({
       userId: 'me',
       q: 'is:unread',
@@ -78,7 +79,7 @@ async function getUnreadEmails() {
 
 async function markAsRead(messageIds) {
   try {
-    await ensureValidToken();
+    if (!await ensureValidToken()) return false;
     await gmail.users.messages.batchModify({
       userId: 'me',
       requestBody: {
@@ -89,44 +90,36 @@ async function markAsRead(messageIds) {
     });
     return true;
   } catch (e) {
-    console.error('Mark as read error:', e.message);
+    console.error('Mark read error:', e.message);
     return false;
   }
 }
 
-async function sendEmail(to, subject, body, inReplyTo = null) {
+async function sendEmail(to, subject, body) {
   try {
-    await ensureValidToken();
-    const email = [
-      `To: ${to}`,
-      `Subject: ${subject}`,
-      'Content-Type: text/plain; charset=utf-8',
-      '',
-      body
-    ].join('\n');
-    const encodedEmail = Buffer.from(email).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    if (!await ensureValidToken()) return false;
+    const email = `To: ${to}\nSubject: ${subject}\nContent-Type: text/plain; charset=utf-8\n\n${body}`;
+    const encoded = Buffer.from(email).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
     await gmail.users.messages.send({
       userId: 'me',
-      requestBody: { raw: encodedEmail, threadId: inReplyTo },
+      requestBody: { raw: encoded },
       auth: oauth2Client
     });
     return true;
   } catch (e) {
-    console.error('Send email error:', e.message);
+    console.error('Send error:', e.message);
     return false;
   }
 }
 
-async function getMeetings(daysAhead = 1, startDate = null) {
+async function getMeetings(startDate, daysAhead = 1) {
   try {
-    await ensureValidToken();
-    const start = startDate || new Date();
-    const startISO = new Date(start.getFullYear(), start.getMonth(), start.getDate()).toISOString();
-    const end = new Date(start.getTime() + daysAhead * 24 * 60 * 60 * 1000).toISOString();
-    
+    if (!await ensureValidToken()) return [];
+    const start = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate()).toISOString();
+    const end = new Date(startDate.getTime() + daysAhead * 24 * 60 * 60 * 1000).toISOString();
     const res = await calendar.events.list({
       calendarId: EMAILS.primary,
-      timeMin: startISO,
+      timeMin: start,
       timeMax: end,
       singleEvents: true,
       orderBy: 'startTime',
@@ -134,7 +127,7 @@ async function getMeetings(daysAhead = 1, startDate = null) {
       auth: oauth2Client
     });
     if (!res.data.items) return [];
-    return res.data.items.slice(0, 50).map(e => ({
+    return res.data.items.map(e => ({
       id: e.id,
       summary: e.summary || '(no title)',
       start: e.start.dateTime || e.start.date,
@@ -148,7 +141,7 @@ async function getMeetings(daysAhead = 1, startDate = null) {
 
 async function createMeeting(title, attendees, startDateTime, durationMinutes = 60) {
   try {
-    await ensureValidToken();
+    if (!await ensureValidToken()) return null;
     const start = new Date(startDateTime);
     const end = new Date(start.getTime() + durationMinutes * 60000);
     const event = {
@@ -160,289 +153,190 @@ async function createMeeting(title, attendees, startDateTime, durationMinutes = 
         { email: EMAILS.pa },
         { email: EMAILS.primary },
         { email: EMAILS.secondary }
-      ],
-      conferenceData: {
-        createRequest: {
-          requestId: `meet-${Date.now()}`,
-          conferenceSolutionKey: { type: 'hangoutsMeet' }
-        }
-      }
+      ]
     };
     const res = await calendar.events.insert({
       calendarId: EMAILS.primary,
       resource: event,
-      conferenceDataVersion: 1,
       sendUpdates: 'all',
       auth: oauth2Client
     });
     return res.data;
   } catch (e) {
-    console.error('Create meeting error:', e.message);
+    console.error('Meeting error:', e.message);
     return null;
   }
 }
 
-async function sendTelegram(chatId, text) {
-  try {
-    await axios.post(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-      chat_id: chatId,
-      text: text,
-      parse_mode: 'Markdown'
-    });
-  } catch (e) {
-    console.error('Telegram error:', e.message);
-  }
-}
-
-function generateSmartReply(emailSubject, emailSnippet) {
-  const lower = (emailSubject + ' ' + emailSnippet).toLowerCase();
-  if (lower.includes('meeting') || lower.includes('call') || lower.includes('schedule')) {
-    return "Thanks for reaching out. I'm available for a meeting. What times work for you?";
-  }
-  if (lower.includes('thank') || lower.includes('appreciate')) {
-    return "You're welcome! Let me know if you need anything else.";
-  }
-  if (lower.includes('question') || lower.includes('ask')) {
-    return "Thanks for your question. Let me get back to you with more details shortly.";
-  }
-  return "Thanks for your email. I'll review this and get back to you soon.";
+async function send(chatId, text) {
+  await axios.post(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    chat_id: chatId,
+    text,
+    parse_mode: 'Markdown'
+  }).catch(e => console.error('Telegram error:', e.message));
 }
 
 async function handleMessage(text, chatId) {
-  const cmd = text.toLowerCase().trim();
-  console.log(`Processing command: ${cmd}`);
+  const lower = text.toLowerCase().trim();
+  console.log(`CMD: "${lower}"`);
   
   // SHOW INBOX
-  if (cmd.includes('inbox') || cmd.includes('emails') || cmd === 'show inbox') {
+  if (lower === 'show inbox' || lower === 'inbox' || lower === 'emails') {
     const emails = await getUnreadEmails();
     if (emails.length === 0) {
-      await sendTelegram(chatId, '✅ No unread emails!');
+      await send(chatId, '✅ No unread emails!');
       return;
     }
     STATE.lastEmailContext[chatId] = emails;
     let list = '';
     emails.forEach((e, i) => {
-      list += `*${i + 1}.* ${e.subject}\n   _From: ${e.from}_\n   ${e.snippet.substring(0, 80)}...\n\n`;
+      list += `*${i + 1}.* ${e.subject}\n   _${e.from}_\n\n`;
     });
-    await sendTelegram(chatId, `📧 *Unread Emails (${emails.length}):*\n\n${list}To reply: "reply 1"\nTo mark as read: "mark as read 1,2,3"`);
+    await send(chatId, `📧 *${emails.length} Unread:*\n\n${list}"reply 1" to draft\n"mark as read 1,2,3"`);
   }
   
   // MARK AS READ
-  else if (cmd.match(/mark as read (.+)/)) {
-    const nums = cmd.match(/mark as read (.+)/)[1].split(',').map(n => parseInt(n.trim()));
+  else if (lower.startsWith('mark as read ')) {
+    const nums = lower.replace('mark as read ', '').split(',').map(n => parseInt(n.trim()));
     const emails = STATE.lastEmailContext[chatId] || [];
-    const toMark = nums.filter(n => n >= 1 && n <= emails.length).map(n => emails[n - 1].id);
-    if (toMark.length === 0) {
-      await sendTelegram(chatId, '❌ Invalid email numbers.');
+    const ids = nums.filter(n => n >= 1 && n <= emails.length).map(n => emails[n - 1].id);
+    if (ids.length === 0) {
+      await send(chatId, '❌ Invalid numbers');
       return;
     }
-    const success = await markAsRead(toMark);
-    if (success) {
-      await sendTelegram(chatId, `✅ Marked ${toMark.length} email(s) as read!`);
-    } else {
-      await sendTelegram(chatId, '❌ Failed to mark as read.');
-    }
+    const ok = await markAsRead(ids);
+    await send(chatId, ok ? `✅ Marked ${ids.length} as read!` : '❌ Failed');
   }
   
-  // REPLY TO EMAIL
-  else if (cmd.match(/^reply (\d+)$/)) {
-    const num = parseInt(cmd.match(/^reply (\d+)$/)[1]);
+  // REPLY
+  else if (lower.startsWith('reply ')) {
+    const num = parseInt(lower.replace('reply ', ''));
     const emails = STATE.lastEmailContext[chatId] || [];
-    console.log(`Reply ${num} - emails available: ${emails.length}`);
-    
     if (num < 1 || num > emails.length) {
-      await sendTelegram(chatId, '❌ Invalid email number. Try "show inbox" first.');
+      await send(chatId, '❌ Invalid. Try "show inbox" first');
       return;
     }
-    
     const email = emails[num - 1];
-    const reply = generateSmartReply(email.subject, email.snippet);
+    const to = email.from.match(/<(.+?)>/) ? email.from.match(/<(.+?)>/)[1] : email.from;
     const draftId = `draft_${Date.now()}`;
-    
-    STATE.emailDrafts[draftId] = {
-      to: email.from.match(/<(.+?)>/) ? email.from.match(/<(.+?)>/)[1] : email.from.split('<')[0].trim(),
-      subject: `Re: ${email.subject}`,
-      body: reply,
-      threadId: email.id
-    };
-    
-    console.log(`Created draft ${draftId}:`, STATE.emailDrafts[draftId]);
-    
-    await sendTelegram(chatId, `📝 *Draft Reply:*\n\nTo: ${STATE.emailDrafts[draftId].to}\nSubject: ${STATE.emailDrafts[draftId].subject}\n\n${reply}\n\n✅ "confirm ${draftId}"`);
+    const body = "Thanks for your email. I'll review and get back to you.";
+    STATE.emailDrafts[draftId] = { to, subject: `Re: ${email.subject}`, body };
+    await send(chatId, `📝 *Draft:*\n\nTo: ${to}\nSubject: Re: ${email.subject}\n\n${body}\n\n✅ confirm ${draftId}`);
   }
   
-  // SEND CUSTOM EMAIL
+  // SEND EMAIL
   else if (text.match(/send email to (.+?) about (.+?): (.+)/i)) {
-    const match = text.match(/send email to (.+?) about (.+?): (.+)/i);
-    const to = match[1].trim();
-    const subject = match[2].trim();
-    const body = match[3].trim();
+    const m = text.match(/send email to (.+?) about (.+?): (.+)/i);
     const draftId = `draft_${Date.now()}`;
-    
-    STATE.emailDrafts[draftId] = { to, subject, body, threadId: null };
-    console.log(`Created email draft ${draftId}:`, STATE.emailDrafts[draftId]);
-    
-    await sendTelegram(chatId, `📝 *Draft Email:*\n\nTo: ${to}\nSubject: ${subject}\n\n${body}\n\n✅ "confirm ${draftId}"`);
+    STATE.emailDrafts[draftId] = { to: m[1].trim(), subject: m[2].trim(), body: m[3].trim() };
+    await send(chatId, `📝 *Draft:*\n\nTo: ${m[1]}\nSubject: ${m[2]}\n\n${m[3]}\n\n✅ confirm ${draftId}`);
   }
   
   // CONFIRM DRAFT
-  else if (cmd.match(/confirm (draft_\d+)/)) {
-    const draftId = cmd.match(/confirm (draft_\d+)/)[1];
-    console.log(`Confirming draft: ${draftId}`);
-    console.log('Available drafts:', Object.keys(STATE.emailDrafts));
-    
+  else if (lower.startsWith('confirm draft_')) {
+    const draftId = lower.replace('confirm ', '');
     const draft = STATE.emailDrafts[draftId];
     if (!draft) {
-      await sendTelegram(chatId, `❌ Draft ${draftId} not found. Available: ${Object.keys(STATE.emailDrafts).join(', ')}`);
+      await send(chatId, '❌ Draft not found');
       return;
     }
-    
-    const sent = await sendEmail(draft.to, draft.subject, draft.body, draft.threadId);
-    if (sent) {
-      await sendTelegram(chatId, `✅ Email sent to ${draft.to}!`);
-      delete STATE.emailDrafts[draftId];
-    } else {
-      await sendTelegram(chatId, '❌ Failed to send email.');
-    }
+    const ok = await sendEmail(draft.to, draft.subject, draft.body);
+    await send(chatId, ok ? `✅ Sent to ${draft.to}!` : '❌ Failed');
+    if (ok) delete STATE.emailDrafts[draftId];
   }
   
   // TODAY
-  else if (cmd === 'today') {
-    const meetings = await getMeetings(1);
+  else if (lower === 'today') {
+    const meetings = await getMeetings(new Date(), 1);
     if (meetings.length === 0) {
-      await sendTelegram(chatId, '📅 No meetings today!');
+      await send(chatId, '📅 No meetings today!');
       return;
     }
     let list = '';
-    meetings.forEach(m => {
-      list += `• *${m.time}* - ${m.summary}\n`;
-    });
-    await sendTelegram(chatId, `📅 *Today (${meetings.length}):*\n\n${list}`);
+    meetings.forEach(m => list += `• ${m.time} - ${m.summary}\n`);
+    await send(chatId, `📅 *Today (${meetings.length}):*\n\n${list}`);
   }
   
   // TOMORROW
-  else if (cmd === 'tomorrow') {
+  else if (lower === 'tomorrow') {
     const tomorrow = new Date();
     tomorrow.setDate(tomorrow.getDate() + 1);
-    const meetings = await getMeetings(1, tomorrow);
+    const meetings = await getMeetings(tomorrow, 1);
     if (meetings.length === 0) {
-      await sendTelegram(chatId, '📅 No meetings tomorrow!');
+      await send(chatId, '📅 No meetings tomorrow!');
       return;
     }
     let list = '';
-    meetings.forEach(m => {
-      list += `• *${m.time}* - ${m.summary}\n`;
-    });
-    await sendTelegram(chatId, `📅 *Tomorrow (${meetings.length}):*\n\n${list}`);
-  }
-  
-  // YESTERDAY
-  else if (cmd === 'yesterday') {
-    const yesterday = new Date();
-    yesterday.setDate(yesterday.getDate() - 1);
-    const meetings = await getMeetings(1, yesterday);
-    if (meetings.length === 0) {
-      await sendTelegram(chatId, '📅 No meetings yesterday!');
-      return;
-    }
-    let list = '';
-    meetings.forEach(m => {
-      list += `• *${m.time}* - ${m.summary}\n`;
-    });
-    await sendTelegram(chatId, `📅 *Yesterday (${meetings.length}):*\n\n${list}`);
+    meetings.forEach(m => list += `• ${m.time} - ${m.summary}\n`);
+    await send(chatId, `📅 *Tomorrow (${meetings.length}):*\n\n${list}`);
   }
   
   // THIS WEEK
-  else if (cmd.includes('this week') || cmd.includes('upcoming')) {
-    const meetings = await getMeetings(7);
+  else if (lower === 'this week' || lower === 'upcoming') {
+    const meetings = await getMeetings(new Date(), 7);
     if (meetings.length === 0) {
-      await sendTelegram(chatId, '📅 No meetings this week!');
+      await send(chatId, '📅 No meetings this week!');
       return;
     }
-    let list = '';
+    // Group by day
+    const byDay = {};
     meetings.forEach(m => {
-      const date = new Date(m.start).toLocaleDateString('en-GB', { weekday: 'short', month: 'short', day: 'numeric' });
-      list += `• *${date} ${m.time}* - ${m.summary}\n`;
+      const day = m.start.substring(0, 10);
+      if (!byDay[day]) byDay[day] = [];
+      byDay[day].push(m);
     });
-    await sendTelegram(chatId, `📅 *This Week (${meetings.length}):*\n\n${list.substring(0, 4000)}`);
+    let list = '';
+    Object.keys(byDay).sort().forEach(day => {
+      const date = new Date(day);
+      const dayName = date.toLocaleDateString('en-GB', { weekday: 'short', month: 'short', day: 'numeric' });
+      list += `\n*${dayName}:*\n`;
+      byDay[day].forEach(m => list += `  • ${m.time} - ${m.summary}\n`);
+    });
+    await send(chatId, `📅 *This Week (${meetings.length}):*${list}`);
   }
   
-  // SCHEDULE MEETING
-  else if (text.match(/schedule meeting with (.+?) (tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday) at (\d+)(am|pm): (.+)/i)) {
-    const match = text.match(/schedule meeting with (.+?) (tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday) at (\d+)(am|pm): (.+)/i);
-    const attendee = match[1].trim();
-    const day = match[2].trim().toLowerCase();
-    const hour = parseInt(match[3]);
-    const meridiem = match[4].toLowerCase();
-    const title = match[5].trim();
+  // SCHEDULE
+  else if (text.match(/schedule meeting with (.+?) (for |at )(today|tomorrow) at (\d+)(am|pm): (.+)/i)) {
+    const m = text.match(/schedule meeting with (.+?) (for |at )(today|tomorrow) at (\d+)(am|pm): (.+)/i);
+    const attendee = m[1].trim();
+    const when = m[3];
+    let hour = parseInt(m[4]);
+    const meridiem = m[5].toLowerCase();
+    const title = m[6].trim();
     
-    const now = new Date();
-    let targetDate = new Date();
+    if (meridiem === 'pm' && hour !== 12) hour += 12;
+    if (meridiem === 'am' && hour === 12) hour = 0;
     
-    if (day === 'tomorrow') {
-      targetDate.setDate(now.getDate() + 1);
-    }
-    
-    let hourValue = hour;
-    if (meridiem === 'pm' && hour !== 12) hourValue += 12;
-    if (meridiem === 'am' && hour === 12) hourValue = 0;
-    
-    targetDate.setHours(hourValue, 0, 0, 0);
+    const targetDate = new Date();
+    if (when === 'tomorrow') targetDate.setDate(targetDate.getDate() + 1);
+    targetDate.setHours(hour, 0, 0, 0);
     
     const draftId = `meeting_${Date.now()}`;
-    STATE.meetingDrafts[draftId] = {
-      title,
-      attendees: [attendee],
-      start: targetDate.toISOString(),
-      duration: 60
-    };
-    
-    console.log(`Created meeting draft ${draftId}:`, STATE.meetingDrafts[draftId]);
-    
-    await sendTelegram(chatId, `📅 *Meeting Draft:*\n\n*${title}*\nWith: ${attendee}\nWhen: ${targetDate.toLocaleString('en-GB')}\nDuration: 60 min\n\n✅ "confirm ${draftId}"`);
+    STATE.meetingDrafts[draftId] = { title, attendees: [attendee], start: targetDate.toISOString(), duration: 60 };
+    await send(chatId, `📅 *Meeting:*\n\n${title}\nWith: ${attendee}\nWhen: ${targetDate.toLocaleString('en-GB')}\n\n✅ confirm ${draftId}`);
   }
   
   // CONFIRM MEETING
-  else if (cmd.match(/confirm (meeting_\d+)/)) {
-    const draftId = cmd.match(/confirm (meeting_\d+)/)[1];
-    console.log(`Confirming meeting: ${draftId}`);
-    
+  else if (lower.startsWith('confirm meeting_')) {
+    const draftId = lower.replace('confirm ', '');
     const draft = STATE.meetingDrafts[draftId];
     if (!draft) {
-      await sendTelegram(chatId, `❌ Meeting ${draftId} not found.`);
+      await send(chatId, '❌ Meeting not found');
       return;
     }
-    
-    const event = await createMeeting(draft.title, draft.attendees, draft.start, draft.duration);
-    if (event) {
-      await sendTelegram(chatId, `✅ Meeting scheduled!\n\n*${draft.title}*\n${new Date(draft.start).toLocaleString('en-GB')}\n\nInvites sent!`);
-      delete STATE.meetingDrafts[draftId];
-    } else {
-      await sendTelegram(chatId, '❌ Failed to create meeting.');
-    }
+    const ok = await createMeeting(draft.title, draft.attendees, draft.start, draft.duration);
+    await send(chatId, ok ? `✅ Meeting scheduled!\n\n${draft.title}\n${new Date(draft.start).toLocaleString('en-GB')}` : '❌ Failed');
+    if (ok) delete STATE.meetingDrafts[draftId];
   }
   
   // HELP
-  else if (cmd.includes('help')) {
-    await sendTelegram(chatId, `👋 *I'm Sonia*
-
-📧 *Email:*
-• "show inbox"
-• "reply 1"
-• "mark as read 1,2,3"
-• "send email to X about Y: message"
-
-📅 *Calendar:*
-• "today" / "tomorrow" / "yesterday"
-• "this week"
-• "schedule meeting with X tomorrow at 2pm: Title"
-
-✅ All send/schedule need "confirm draft_XXX"`);
+  else if (lower === 'help') {
+    await send(chatId, `📧 *Email:* "show inbox", "reply 1", "mark as read 1,2", "send email to X about Y: message", "confirm draft_XXX"\n\n📅 *Calendar:* "today", "tomorrow", "this week", "schedule meeting with X for today at 2pm: Title", "confirm meeting_XXX"`);
   }
   
   // DEFAULT
   else {
-    await sendTelegram(chatId, '👋 Try: "show inbox", "today", "help"');
+    await send(chatId, '👋 Try: "show inbox", "today", "help"');
   }
 }
 
@@ -453,12 +347,12 @@ app.post('/telegram/webhook', async (req, res) => {
   try {
     const msg = req.body.message;
     if (msg && msg.text) {
-      console.log(`[${new Date().toISOString()}] ${msg.from.first_name}: ${msg.text}`);
+      console.log(`[${new Date().toISOString()}] ${msg.text}`);
       await handleMessage(msg.text, msg.chat.id);
     }
     res.json({ ok: true });
   } catch (e) {
-    console.error('Error:', e.message);
+    console.error(e);
     res.json({ ok: false });
   }
 });
@@ -466,4 +360,4 @@ app.post('/telegram/webhook', async (req, res) => {
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Sonia on port ${PORT}`));
+app.listen(PORT, () => console.log(`Sonia on ${PORT}`));
